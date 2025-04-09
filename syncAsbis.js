@@ -1,53 +1,77 @@
 
-const mongoose = require('mongoose');
-const xmlFlow = require('xml-flow');
-const fs = require('fs');
-const path = require('path');
-const Product = require('./productModel'); // mongoose модел
+const mongoose = require("mongoose");
+const axios = require("axios");
+const xmlFlow = require("xml-flow");
+const Product = require("./models/Product");
+require("dotenv").config();
 
-require('dotenv').config();
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-});
+const MONGO_URI = process.env.MONGO_URI;
 
-const stream = fs.createReadStream(path.join(__dirname, 'ProductList.xml'));
-const xml = xmlFlow(stream);
-
-let savedCount = 0;
-let skippedCount = 0;
-
-xml.on('tag:PRICE', async function (item) {
+async function syncAsbis() {
+  console.log("🚀 Starting ASBIS sync...");
   try {
-    const price = parseFloat(item.MY_PRICE);
-    const availability = item.AVAIL && item.AVAIL.trim().toLowerCase() === 'да';
+    await mongoose.connect(MONGO_URI);
+    console.log("✅ Connected to MongoDB");
 
-    if (!availability || isNaN(price) || price <= 0) {
-      skippedCount++;
-      return;
-    }
+    const productUrl = "https://services.it4profit.com/product/bg/714/ProductList.xml?USERNAME=dipetrov&PASSWORD=Asbisbank";
+    const priceUrl = "https://services.it4profit.com/product/bg/714/PriceAvail.xml?USERNAME=dipetrov&PASSWORD=Asbisbank";
 
-    const product = {
-      sku: item.WIC,
-      name: item.DESCRIPTION,
-      price: price,
-      currency: item.CURRENCY_CODE || 'USD',
-      stock: availability ? 1 : 0,
-      vendor: item.VENDOR_NAME,
-      image: item.SMALL_IMAGE || '',
-      productCard: item.PRODUCT_CARD || '',
-      ean: item.EAN || '',
-      group: item.GROUP_NAME || '',
-    };
+    console.log("⏳ Fetching ProductList.xml...");
+    const productResponse = await axios.get(productUrl, { responseType: "stream" });
+    const productStream = xmlFlow(productResponse.data);
 
-    await Product.updateOne({ sku: product.sku }, product, { upsert: true });
-    savedCount++;
-  } catch (error) {
-    console.error('❌ Error saving product:', error.message);
+    const products = {};
+
+    productStream.on("tag:PRICE", (item) => {
+      if (item && item.WIC && item.DESCRIPTION) {
+        products[item.WIC] = {
+          sku: item.WIC,
+          name: item.DESCRIPTION,
+          brand: item.VENDOR_NAME || "",
+          image: item.SMALL_IMAGE || "",
+          product_url: item.PRODUCT_CARD || "",
+          ean: item.EAN || "",
+        };
+      }
+    });
+
+    await new Promise((resolve) => productStream.on("end", resolve));
+
+    console.log("⏳ Fetching PriceAvail.xml...");
+    const priceResponse = await axios.get(priceUrl, { responseType: "stream" });
+    const priceStream = xmlFlow(priceResponse.data);
+
+    const finalProducts = [];
+
+    priceStream.on("tag:PRICE", (entry) => {
+      const wic = entry.WIC;
+      const product = products[wic];
+      if (!product) return;
+
+      const availability = (entry.AVAIL || "").trim().toLowerCase();
+      const price = parseFloat(entry.MY_PRICE);
+      if (availability === "да" && price > 0) {
+        finalProducts.push({
+          ...product,
+          price: price,
+          stock: 1,
+          source: "asbis",
+          currency: (entry.CURRENCY_CODE || "USD").trim()
+        });
+      }
+    });
+
+    await new Promise((resolve) => priceStream.on("end", resolve));
+    console.log(`✅ Loaded ${finalProducts.length} entries`);
+
+    await Product.deleteMany({ source: "asbis" });
+    await Product.insertMany(finalProducts);
+    console.log("📦 Synced ASBIS products successfully!");
+
+    mongoose.disconnect();
+  } catch (err) {
+    console.error("❌ Sync error:", err);
   }
-});
+}
 
-xml.on('end', () => {
-  console.log(`✅ Sync complete. Saved: ${savedCount}, Skipped: ${skippedCount}`);
-  mongoose.disconnect();
-});
+syncAsbis();
