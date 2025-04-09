@@ -1,85 +1,53 @@
-const axios = require("axios");
-const xmlFlow = require("xml-flow");
-const Product = require("./productModel");
-const xml2js = require("xml2js");
-const { Readable } = require("stream");
 
-const ASBIS_PRODUCTS_URL = "https://services.it4profit.com/product/bg/714/ProductList.xml?USERNAME=dipetrov&PASSWORD=Asbisb@nk";
-const ASBIS_PRICE_URL = "https://services.it4profit.com/product/bg/714/PriceAvail.xml?USERNAME=dipetrov&PASSWORD=Asbisb@nk";
+const mongoose = require('mongoose');
+const xmlFlow = require('xml-flow');
+const fs = require('fs');
+const path = require('path');
+const Product = require('./models/Product'); // mongoose модел
 
-async function fetchRawXml(url) {
-  console.log(`⏳ Fetching raw XML from ${url}...`);
-  const { data } = await axios.get(url);
-  return data;
-}
+require('dotenv').config();
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+});
 
-async function fetchPriceMap() {
-  console.log("⏳ Fetching PriceAvail.xml...");
-  const raw = await fetchRawXml(ASBIS_PRICE_URL);
-  const parsed = await xml2js.parseStringPromise(raw, { explicitArray: false });
-  const products = parsed?.PriceAvailability?.Product || [];
-  const prices = {};
+const stream = fs.createReadStream(path.join(__dirname, 'ProductList.xml'));
+const xml = xmlFlow(stream);
 
-  for (const item of products) {
-    const code = item.ProductCode;
-    const price = parseFloat(item.EndUserPrice || 0);
-    const stock = parseInt(item.StockQty || 0);
-    if (price > 0 && stock > 0) {
-      prices[code] = { price, stock };
-    }
-  }
+let savedCount = 0;
+let skippedCount = 0;
 
-  console.log(`✅ Loaded ${Object.keys(prices).length} price entries`);
-  return prices;
-}
-
-async function syncAsbisProducts() {
+xml.on('tag:PRICE', async function (item) {
   try {
-    const rawXml = await fetchRawXml(ASBIS_PRODUCTS_URL);
-    const priceMap = await fetchPriceMap();
-    const stream = new Readable();
-    stream.push(rawXml);
-    stream.push(null);
+    const price = parseFloat(item.MY_PRICE);
+    const availability = item.AVAIL && item.AVAIL.trim().toLowerCase() === 'да';
 
-    const xmlStream = xmlFlow(stream);
-    let counter = 0;
+    if (!availability || isNaN(price) || price <= 0) {
+      skippedCount++;
+      return;
+    }
 
-    await Product.deleteMany({ source: "asbis" });
-    console.log("🧹 Cleared old ASBIS entries from MongoDB");
+    const product = {
+      sku: item.WIC,
+      name: item.DESCRIPTION,
+      price: price,
+      currency: item.CURRENCY_CODE || 'USD',
+      stock: availability ? 1 : 0,
+      vendor: item.VENDOR_NAME,
+      image: item.SMALL_IMAGE || '',
+      productCard: item.PRODUCT_CARD || '',
+      ean: item.EAN || '',
+      group: item.GROUP_NAME || '',
+    };
 
-    xmlStream.on("tag:Product", async (p) => {
-      const code = p.ProductCode;
-      if (!priceMap[code]) return;
-
-      const product = {
-        sku: code,
-        name: p.ProdDescr,
-        ean: p.EANCode || "",
-        stock: priceMap[code].stock,
-        price: priceMap[code].price,
-        source: "asbis",
-        updatedAt: new Date(),
-      };
-
-      try {
-        await Product.insertOne(product);
-        counter++;
-        if (counter % 100 === 0) console.log(`📦 Inserted ${counter} products...`);
-      } catch (e) {
-        console.error("❌ Error inserting product:", e.message);
-      }
-    });
-
-    return new Promise((resolve) => {
-      xmlStream.on("end", () => {
-        console.log(`✅ Sync complete (${counter} products saved)`);
-        resolve(counter);
-      });
-    });
-  } catch (err) {
-    console.error("❌ Sync failed:", err.message);
-    return 0;
+    await Product.updateOne({ sku: product.sku }, product, { upsert: true });
+    savedCount++;
+  } catch (error) {
+    console.error('❌ Error saving product:', error.message);
   }
-}
+});
 
-module.exports = { syncAsbisProducts };
+xml.on('end', () => {
+  console.log(`✅ Sync complete. Saved: ${savedCount}, Skipped: ${skippedCount}`);
+  mongoose.disconnect();
+});
