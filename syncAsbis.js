@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const xmlFlow = require('xml-flow');
 const fs = require('fs');
 const path = require('path');
-const Product = require('./models/Product'); // mongoose модел
+const Product = require('./productModel'); // mongoose модел
 
 require('dotenv').config();
 mongoose.connect(process.env.MONGODB_URI, {
