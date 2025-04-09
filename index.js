@@ -3,7 +3,7 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const { syncAsbisProducts } = require("./syncAsbis");
-const Product = require("./productModel");
+const Product = require("./models/productModel");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
